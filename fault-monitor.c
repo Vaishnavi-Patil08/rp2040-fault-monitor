@@ -1,4 +1,6 @@
 #include <hardware/gpio.h>
+#include <hardware/regs/intctrl.h>
+#include <hardware/structs/io_bank0.h>
 #include <hardware/timer.h>
 #include <pico/error.h>
 #include <pico/stdio.h>
@@ -7,6 +9,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <hardware/uart.h>
+#include <hardware/irq.h>
+
 #include "pico/stdlib.h"
 #define LED_PIN 15
 #define LED_MASK (1u<<LED_PIN)
@@ -18,10 +23,18 @@
 #define COUNTER_BUDGET_US 100u
 #define FAULT_LOG_SIZE 50u
 #define CMD_BUFFER_SIZE 64u
+#define UART_ID uart0
+#define UART_TX_PIN 0
+#define UART_RX_PIN 1
+#define UART_BAUD 115200
+#define UART_RX_BUFFER_SIZE 128u
+
+
 
 volatile uint32_t *gpio_oe_set=(volatile uint32_t *) GPIO_OE_SET;
 volatile uint32_t *gpio_out_set= (volatile uint32_t *) GPIO_OUT_SET;
 volatile uint32_t *gpio_out_clear= (volatile uint32_t *) GPIO_OUT_CLR;
+
 
 typedef struct {    
         uint32_t taskRuns;
@@ -64,6 +77,16 @@ typedef struct{
     uint32_t writeIndex;
 } FaultLogs;
 
+typedef struct{
+    char data[UART_RX_BUFFER_SIZE];
+    volatile uint32_t readIndex;
+    volatile uint32_t writeIndex;
+    volatile bool overflow;
+
+}UartRxBuffer;
+static UartRxBuffer uartrxBuffer={0};
+
+
 void led_task(bool* toggleFlag)
 {
     if(*toggleFlag)
@@ -82,7 +105,10 @@ void counter_task(uint32_t* counter)
 
 void health_task(uint32_t overRun, bool overRunFault, uint64_t maxCounterExec,uint32_t TaskRuns)
 {
-    printf("HEALTH CHECK: Total OverRuns: %u, overRunFault: %d, Max Counter Exec Time: %llu, health counter: %u \n", overRun,overRunFault,maxCounterExec,TaskRuns);
+    char output[160];
+    snprintf(output, sizeof(output), "HEALTH: Total OverRuns: %u, overRunFault: %d, Max Counter Exec Time: %llu, health counter: %u \r\n", overRun,overRunFault,maxCounterExec,TaskRuns);
+    uart_puts(UART_ID, output);
+    // printf("HEALTH CHECK: Total OverRuns: %u, overRunFault: %d, Max Counter Exec Time: %llu, health counter: %u \n", overRun,overRunFault,maxCounterExec,TaskRuns);
 
 }
 
@@ -109,7 +135,10 @@ void print_fault_logs(const FaultLogs *faultLogs)
     for(int i=0;i<faultLogs->validCount;i++)
     {
         uint32_t ind=(oldest+i)%FAULT_LOG_SIZE;
-        printf("Fault Record: ID:%u, Severity:%u, Time Stamp:%llu\n",faultLogs->faultLogsArr[ind].id,faultLogs->faultLogsArr[ind].Severity,faultLogs->faultLogsArr[ind].timestampUs);
+        char output[300];
+        snprintf(output,sizeof(output),"Fault Record: ID:%u, Severity:%u, Time Stamp:%llu\r\n",faultLogs->faultLogsArr[ind].id,faultLogs->faultLogsArr[ind].Severity,faultLogs->faultLogsArr[ind].timestampUs);
+        // printf("Fault Record: ID:%u, Severity:%u, Time Stamp:%llu\n",faultLogs->faultLogsArr[ind].id,faultLogs->faultLogsArr[ind].Severity,faultLogs->faultLogsArr[ind].timestampUs);
+        uart_puts(UART_ID, output);
 
     }
 
@@ -130,17 +159,40 @@ void command_line(char *cmdBuffer, taskHealth counter, FaultLogs *faultLogs, boo
     else if(strcmp(cmdBuffer, "inject on")==0)
     {
         *injectCounterOverrun=true;
+        uart_puts(UART_ID, "Fault Injection Enabled\r\n");
     }
     else if(strcmp(cmdBuffer, "inject off")==0)
     {
         *injectCounterOverrun=false;
+        uart_puts(UART_ID,"Fault Injection Disabled\r\n");
     }
     else 
     {
-        printf("Command not found\n");
+        // printf("Command not found\n");
+        uart_puts(UART_ID, "Command not found\r\n");
     
     }
 
+}
+
+void uart_rx_handler(void)
+{
+
+    while(uart_is_readable(UART_ID))
+    {
+        char ch=uart_getc(UART_ID);
+
+        uint32_t nextWrite=(uartrxBuffer.writeIndex+1)%UART_RX_BUFFER_SIZE;
+
+        if(nextWrite==uartrxBuffer.readIndex)
+            uartrxBuffer.overflow=true;
+        else
+         {
+            uartrxBuffer.data[uartrxBuffer.writeIndex]=ch;
+            uartrxBuffer.writeIndex=nextWrite;
+         };
+    }
+    
 }
 
 
@@ -173,9 +225,15 @@ int main()
     *gpio_oe_set=LED_MASK;
     *gpio_out_clear = LED_MASK;
 
+    uart_init(UART_ID, UART_BAUD);
+    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+    irq_set_exclusive_handler(UART0_IRQ, uart_rx_handler);
+    uart_set_irq_enables(UART_ID, true, false);
+    irq_set_enabled(UART0_IRQ, true);
 
-    
-    
+
+
 
     while (true) {
         
@@ -208,42 +266,67 @@ int main()
 
                  record_faults(FaultOverrun,  SEVERITY_WARNING, &faultLogs);
             
-            }
-            
+            }            
             if(counterExec>counterHealth.maxExec)
             counterHealth.maxExec=counterExec;
 
-
-
         }
 
-        int ch=getchar_timeout_us(0);
-        if(ch==PICO_ERROR_TIMEOUT)
-            continue;
-        else
-         {
-            char chr=(char)ch;
-            if((chr=='\r')||(chr=='\n'))
-            {        
+        // int ch=getchar_timeout_us(0);
+        // if(ch!=PICO_ERROR_TIMEOUT)
+        //  {
+        //     char chr=(char)ch;
+        //     if((chr=='\r')||(chr=='\n'))
+        //     {        
+        //         if(cmdInd>0)
+        //         {
+        //             cmdBuffer[cmdInd]='\0';
+        //             command_line(cmdBuffer, counterHealth, &faultLogs, &injectCounterOverrun);
+        //             cmdInd=0;
+        //         }
+        //     }
+        //     else 
+        //     {
+        //         if(cmdInd<CMD_BUFFER_SIZE-1)
+        //         {
+        //             cmdBuffer[cmdInd]=chr;
+        //             cmdInd++;
+        //         }
+
+        //     }
+            
+
+        //  }
+
+        while(uartrxBuffer.readIndex!=uartrxBuffer.writeIndex)
+        {
+            char uartCh=uartrxBuffer.data[uartrxBuffer.readIndex];
+            uartrxBuffer.readIndex=(uartrxBuffer.readIndex+1)%UART_RX_BUFFER_SIZE;
+
+            uart_putc_raw(UART_ID, uartCh);
+
+            if(uartCh=='\r'||uartCh=='\n')
+            {
                 if(cmdInd>0)
                 {
                     cmdBuffer[cmdInd]='\0';
                     command_line(cmdBuffer, counterHealth, &faultLogs, &injectCounterOverrun);
                     cmdInd=0;
                 }
+
             }
             else 
             {
                 if(cmdInd<CMD_BUFFER_SIZE-1)
                 {
-                    cmdBuffer[cmdInd]=chr;
+                    cmdBuffer[cmdInd]=uartCh;
                     cmdInd++;
+
                 }
-
-            }
+                
             
+            }
 
-         }
-        
+        }
     }
 }
