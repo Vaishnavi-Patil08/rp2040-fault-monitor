@@ -46,7 +46,8 @@ pico_enable_stdio_usb(fault-monitor 1)
 
 # Add the standard library to the build
 target_link_libraries(fault-monitor
-        pico_stdlib)
+        pico_stdlib 
+        hardware_adc)
 
 # Add the standard include files to the build
 target_include_directories(fault-monitor PRIVATE

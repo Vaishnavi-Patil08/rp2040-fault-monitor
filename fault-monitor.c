@@ -11,6 +11,7 @@
 #include <string.h>
 #include <hardware/uart.h>
 #include <hardware/irq.h>
+#include <hardware/adc.h>
 
 #include "pico/stdlib.h"
 #define LED_PIN 15
@@ -28,6 +29,10 @@
 #define UART_RX_PIN 1
 #define UART_BAUD 115200
 #define UART_RX_BUFFER_SIZE 128u
+#define ADC_PIN 26
+#define MIN_MV 1000u
+#define MAX_MV 2500u
+
 
 
 
@@ -41,6 +46,9 @@ typedef struct {
         uint32_t overRun;
         bool overRunFault;
         uint64_t maxExec;
+        uint32_t sensorValue;
+        bool sensorFault;
+
 }taskHealth;
 
 typedef struct{
@@ -103,10 +111,10 @@ void counter_task(uint32_t* counter)
 
 }
 
-void health_task(uint32_t overRun, bool overRunFault, uint64_t maxCounterExec,uint32_t TaskRuns)
+void health_task(taskHealth counter)
 {
     char output[160];
-    snprintf(output, sizeof(output), "HEALTH: Total OverRuns: %u, overRunFault: %d, Max Counter Exec Time: %llu, health counter: %u \r\n", overRun,overRunFault,maxCounterExec,TaskRuns);
+    snprintf(output, sizeof(output), "HEALTH: Total OverRuns: %u, overRunFault: %d, Max Counter Exec Time: %llu, health counter: %u , sensor value: %u, sensor fault:%d\r\n", counter.overRun,counter.overRunFault, counter.maxExec, counter.taskRuns, counter.sensorValue,counter.sensorFault);
     uart_puts(UART_ID, output);
     // printf("HEALTH CHECK: Total OverRuns: %u, overRunFault: %d, Max Counter Exec Time: %llu, health counter: %u \n", overRun,overRunFault,maxCounterExec,TaskRuns);
 
@@ -148,7 +156,7 @@ void command_line(char *cmdBuffer, taskHealth counter, FaultLogs *faultLogs, boo
 {
     if (strcmp(cmdBuffer,"status")==0)
     {
-        health_task( counter.overRun,counter.overRunFault, counter.maxExec, counter.taskRuns);
+        health_task(counter);
         
     }
     else if(strcmp(cmdBuffer, "faults")==0)
@@ -195,6 +203,25 @@ void uart_rx_handler(void)
     
 }
 
+void sensor_task(uint32_t sensorMilliVolts, bool *sensorFaultActive,FaultLogs *faultLogs )
+{
+    if(sensorMilliVolts<MIN_MV || sensorMilliVolts>MAX_MV)
+    {
+        if(!(*sensorFaultActive))
+        {
+            *sensorFaultActive=true;
+            record_faults(FaultSensorRange, SEVERITY_ERROR, faultLogs);
+        }
+        
+    }
+    else 
+    {
+        *sensorFaultActive=false;
+
+    }
+
+}
+
 
 
 int main()
@@ -215,6 +242,9 @@ int main()
     bool injectCounterOverrun = false;
     char cmdBuffer[CMD_BUFFER_SIZE];
     uint32_t cmdInd=0;
+    uint32_t lastSensorCheck=0;
+    uint32_t sensorMilliVolts=0;
+    bool sensorFaultActive=false;
 
     
     volatile uint32_t *reg15=(volatile uint32_t *) GPIO15_CTRL;
@@ -231,6 +261,10 @@ int main()
     irq_set_exclusive_handler(UART0_IRQ, uart_rx_handler);
     uart_set_irq_enables(UART_ID, true, false);
     irq_set_enabled(UART0_IRQ, true);
+
+    adc_init();
+    adc_gpio_init(ADC_PIN);
+    adc_select_input(0);
 
 
 
@@ -272,31 +306,6 @@ int main()
 
         }
 
-        // int ch=getchar_timeout_us(0);
-        // if(ch!=PICO_ERROR_TIMEOUT)
-        //  {
-        //     char chr=(char)ch;
-        //     if((chr=='\r')||(chr=='\n'))
-        //     {        
-        //         if(cmdInd>0)
-        //         {
-        //             cmdBuffer[cmdInd]='\0';
-        //             command_line(cmdBuffer, counterHealth, &faultLogs, &injectCounterOverrun);
-        //             cmdInd=0;
-        //         }
-        //     }
-        //     else 
-        //     {
-        //         if(cmdInd<CMD_BUFFER_SIZE-1)
-        //         {
-        //             cmdBuffer[cmdInd]=chr;
-        //             cmdInd++;
-        //         }
-
-        //     }
-            
-
-        //  }
 
         while(uartrxBuffer.readIndex!=uartrxBuffer.writeIndex)
         {
@@ -328,5 +337,18 @@ int main()
             }
 
         }
+
+        if(current-lastSensorCheck>=500)
+        {
+            uint16_t rawValue=adc_read();
+            sensorMilliVolts = ((uint32_t)rawValue * 3300u) / 4095u;
+            sensor_task(sensorMilliVolts, &sensorFaultActive, &faultLogs);
+            counterHealth.sensorValue=sensorMilliVolts;
+            counterHealth.sensorFault=sensorFaultActive;
+            lastSensorCheck=current;
+    
+
+        }
+       
     }
 }
