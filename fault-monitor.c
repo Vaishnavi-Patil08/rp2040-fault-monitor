@@ -94,6 +94,12 @@ typedef struct{
 }UartRxBuffer;
 static UartRxBuffer uartrxBuffer={0};
 
+typedef struct{
+    uint32_t lastHeartbeat;
+    bool stallFaultActive;
+    uint32_t timeoutMs;
+}TaskHeartbeat;
+
 
 void led_task(bool* toggleFlag)
 {
@@ -152,7 +158,7 @@ void print_fault_logs(const FaultLogs *faultLogs)
 
 }
 
-void command_line(char *cmdBuffer, taskHealth counter, FaultLogs *faultLogs, bool *injectCounterOverrun )
+void command_line(char *cmdBuffer, taskHealth counter, FaultLogs *faultLogs, bool *injectCounterOverrun, bool *injectCounterStall)
 {
     if (strcmp(cmdBuffer,"status")==0)
     {
@@ -173,6 +179,17 @@ void command_line(char *cmdBuffer, taskHealth counter, FaultLogs *faultLogs, boo
     {
         *injectCounterOverrun=false;
         uart_puts(UART_ID,"Fault Injection Disabled\r\n");
+    }
+    else if(strcmp(cmdBuffer, "stall on")==0)
+    {
+        *injectCounterStall=true;
+        uart_puts(UART_ID, "Counter Injection Enabled\r\n");
+
+    }
+    else if(strcmp(cmdBuffer,"stall off")==0)
+    {
+        *injectCounterStall=false;
+        uart_puts(UART_ID, "Counter Injection Disabled\r\n");
     }
     else 
     {
@@ -222,6 +239,26 @@ void sensor_task(uint32_t sensorMilliVolts, bool *sensorFaultActive,FaultLogs *f
 
 }
 
+void heartbeat_checker(TaskHeartbeat *task, uint32_t current, FaultLogs *faultLogs)
+{
+    if((current - task->lastHeartbeat)>=task->timeoutMs)
+    {
+        if(!task->stallFaultActive)
+        {
+            task->stallFaultActive=true;
+            record_faults(FaultStall, SEVERITY_CRITICAL, faultLogs);
+
+        }
+        
+    }
+    else 
+    {
+        task->stallFaultActive=false;
+    
+    }
+
+}
+
 
 
 int main()
@@ -245,6 +282,9 @@ int main()
     uint32_t lastSensorCheck=0;
     uint32_t sensorMilliVolts=0;
     bool sensorFaultActive=false;
+    TaskHeartbeat counterHeartbeat={0,false,1000};
+    TaskHeartbeat sensorHeartbeat={0,false,2000};
+    bool injectCounterStall=false;
 
     
     volatile uint32_t *reg15=(volatile uint32_t *) GPIO15_CTRL;
@@ -285,14 +325,17 @@ int main()
 
         if((current-lastCounter)>=250)
         {
+            if(!injectCounterStall)
+            {
             counterHealth.taskRuns++;
             counterTime.start=time_us_64();
             counter_task(&counter);
             if(injectCounterOverrun)
                 sleep_ms(1);
             counterTime.end=time_us_64();
+            counterHeartbeat.lastHeartbeat=current;
             counterExec=counterTime.end-counterTime.start;
-            lastCounter=current;
+            // lastCounter=current;
             if(counterExec>COUNTER_BUDGET_US)
             {
                 counterHealth.overRun++;
@@ -303,6 +346,9 @@ int main()
             }            
             if(counterExec>counterHealth.maxExec)
             counterHealth.maxExec=counterExec;
+            }
+            lastCounter=current;
+            
 
         }
 
@@ -319,7 +365,7 @@ int main()
                 if(cmdInd>0)
                 {
                     cmdBuffer[cmdInd]='\0';
-                    command_line(cmdBuffer, counterHealth, &faultLogs, &injectCounterOverrun);
+                    command_line(cmdBuffer, counterHealth, &faultLogs, &injectCounterOverrun, &injectCounterStall);
                     cmdInd=0;
                 }
 
@@ -346,9 +392,13 @@ int main()
             counterHealth.sensorValue=sensorMilliVolts;
             counterHealth.sensorFault=sensorFaultActive;
             lastSensorCheck=current;
+            sensorHeartbeat.lastHeartbeat=current;
     
 
         }
+
+        heartbeat_checker(&counterHeartbeat,  current, &faultLogs);
+        heartbeat_checker(&sensorHeartbeat, current, &faultLogs);
        
     }
 }
