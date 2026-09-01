@@ -12,6 +12,7 @@
 #include <hardware/uart.h>
 #include <hardware/irq.h>
 #include <hardware/adc.h>
+#include <hardware/watchdog.h>
 
 #include "pico/stdlib.h"
 #define LED_PIN 15
@@ -100,6 +101,11 @@ typedef struct{
     uint32_t timeoutMs;
 }TaskHeartbeat;
 
+typedef struct{
+    bool recoverMode;
+    uint32_t recover_counter;
+
+}SystemState;
 
 void led_task(bool* toggleFlag)
 {
@@ -117,10 +123,10 @@ void counter_task(uint32_t* counter)
 
 }
 
-void health_task(taskHealth counter)
+void health_task(taskHealth counter, SystemState sysState)
 {
-    char output[160];
-    snprintf(output, sizeof(output), "HEALTH: Total OverRuns: %u, overRunFault: %d, Max Counter Exec Time: %llu, health counter: %u , sensor value: %u, sensor fault:%d\r\n", counter.overRun,counter.overRunFault, counter.maxExec, counter.taskRuns, counter.sensorValue,counter.sensorFault);
+    char output[256];
+    snprintf(output, sizeof(output), "HEALTH: Total OverRuns: %u, overRunFault: %d, Max Counter Exec Time: %llu, health counter: %u , sensor value: %u, sensor fault:%d, recovery mode:%d, recoveries:%u\r\n", counter.overRun,counter.overRunFault, counter.maxExec, counter.taskRuns, counter.sensorValue,counter.sensorFault,sysState.recoverMode,sysState.recover_counter );
     uart_puts(UART_ID, output);
     // printf("HEALTH CHECK: Total OverRuns: %u, overRunFault: %d, Max Counter Exec Time: %llu, health counter: %u \n", overRun,overRunFault,maxCounterExec,TaskRuns);
 
@@ -158,11 +164,11 @@ void print_fault_logs(const FaultLogs *faultLogs)
 
 }
 
-void command_line(char *cmdBuffer, taskHealth counter, FaultLogs *faultLogs, bool *injectCounterOverrun, bool *injectCounterStall)
+void command_line(char *cmdBuffer, taskHealth counter, FaultLogs *faultLogs, bool *injectCounterOverrun, bool *injectCounterStall, SystemState sysState, TaskHeartbeat *counterHealth)
 {
     if (strcmp(cmdBuffer,"status")==0)
     {
-        health_task(counter);
+        health_task(counter,sysState);
         
     }
     else if(strcmp(cmdBuffer, "faults")==0)
@@ -191,6 +197,16 @@ void command_line(char *cmdBuffer, taskHealth counter, FaultLogs *faultLogs, boo
         *injectCounterStall=false;
         uart_puts(UART_ID, "Counter Injection Disabled\r\n");
     }
+
+    else if(strcmp(cmdBuffer, "hang")==0)
+    {
+        uart_puts(UART_ID, "Injecting complete firmware hang\r\n");
+        while (true)
+        {
+            //intentional watchdog test
+        };
+    }
+
     else 
     {
         // printf("Command not found\n");
@@ -247,7 +263,6 @@ void heartbeat_checker(TaskHeartbeat *task, uint32_t current, FaultLogs *faultLo
         {
             task->stallFaultActive=true;
             record_faults(FaultStall, SEVERITY_CRITICAL, faultLogs);
-
         }
         
     }
@@ -257,6 +272,25 @@ void heartbeat_checker(TaskHeartbeat *task, uint32_t current, FaultLogs *faultLo
     
     }
 
+}
+
+void apply_recover_policy(TaskHeartbeat *counterHealth, SystemState *sysState, bool *injectCounterStall)
+{
+    if (counterHealth->stallFaultActive && !sysState->recoverMode)
+    {
+            uart_puts(UART_ID, "CRITICAL: Counter stall detected\r\n");
+            sysState->recoverMode=true;
+            uart_puts(UART_ID, "Automatic recovery initiated\r\n");
+            *injectCounterStall=false;
+   
+    }
+    else if(!counterHealth->stallFaultActive && sysState->recoverMode)
+    {
+        sysState->recoverMode=false;
+        sysState->recover_counter++;
+        uart_puts(UART_ID, "System Recovered successfully\r\n");
+    }
+    
 }
 
 
@@ -285,6 +319,7 @@ int main()
     TaskHeartbeat counterHeartbeat={0,false,1000};
     TaskHeartbeat sensorHeartbeat={0,false,2000};
     bool injectCounterStall=false;
+    SystemState sysState={0};
 
     
     volatile uint32_t *reg15=(volatile uint32_t *) GPIO15_CTRL;
@@ -306,7 +341,13 @@ int main()
     adc_gpio_init(ADC_PIN);
     adc_select_input(0);
 
+    bool watchdogReset=watchdog_caused_reboot();
+    if(watchdogReset)
+        uart_puts(UART_ID, "BOOT: Previous reset caused by watchdog\r\n");
+    else
+        uart_puts(UART_ID, "BOOT: normal reset\r\n");
 
+    watchdog_enable(2000, true);
 
 
     while (true) {
@@ -365,7 +406,7 @@ int main()
                 if(cmdInd>0)
                 {
                     cmdBuffer[cmdInd]='\0';
-                    command_line(cmdBuffer, counterHealth, &faultLogs, &injectCounterOverrun, &injectCounterStall);
+                    command_line(cmdBuffer, counterHealth, &faultLogs, &injectCounterOverrun, &injectCounterStall,sysState,&counterHeartbeat);
                     cmdInd=0;
                 }
 
@@ -398,7 +439,10 @@ int main()
         }
 
         heartbeat_checker(&counterHeartbeat,  current, &faultLogs);
+        apply_recover_policy(&counterHeartbeat, &sysState, &injectCounterStall);
         heartbeat_checker(&sensorHeartbeat, current, &faultLogs);
-       
+        
+        watchdog_update();
     }
+    
 }
