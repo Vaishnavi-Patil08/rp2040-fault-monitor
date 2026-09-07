@@ -1,5 +1,11 @@
 import time
 import serial
+import argparse
+
+parser=argparse.ArgumentParser()
+parser.add_argument("--port", required=True, help="Serial port connectec to the Pico UART")
+args=parser.parse_args()
+
 
 def send_command(ser,command):
     ser.write((command+"\r\n").encode())
@@ -131,7 +137,7 @@ def synchronize_parser(ser):
     time.sleep(0.1)
     ser.reset_input_buffer()
 
-with serial.Serial("/dev/cu.usbserial-A5069RR4",115200,timeout=0.1) as ser:
+with serial.Serial(args.port,115200,timeout=0.1) as ser:
     synchronize_parser(ser)
     response=send_command(ser,"status")
     print(f"Data recieved from Pico:{response}")
